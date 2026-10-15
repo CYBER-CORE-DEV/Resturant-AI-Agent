@@ -9,6 +9,13 @@ If something goes wrong on the way (dish not available, oil finished, nobody fre
 to serve...) the graph jumps straight to END and the customer gets a message
 saying what happened.
 
+Every kind of failure has a limit for the whole chat. Failures up to the limit are
+just reported, the next one sends the graph to the quit node and the chat ends:
+
+    dish not on the menu  ->  4 refusals, the 5th one quits
+    cooking fails         ->  3 times, the 4th one quits
+    serving fails         ->  4 times, the 5th one quits
+
 Setup:
     pip install langgraph groq python-dotenv qrcode
     put GROQ_API_KEY=... in your .env file
@@ -50,6 +57,11 @@ KITCHEN = {"oil": 3}      # every order uses 1 oil, at 0 we can't cook anymore
 SERVE_FAILURE_RATE = 0.2  # 0 = serving never fails, 1 = always fails
 DARK_TERMINAL = True      # set to False if the QR looks inverted on a light terminal
 
+# how many failures of each kind we put up with in one chat, the next one ends it
+MAX_ORDER_FAILURES = 4  # only dishes that aren't on the menu (or are sold out) count
+MAX_COOK_FAILURES = 3
+MAX_SERVE_FAILURES = 4
+
 order_numbers = itertools.count(1001)
 
 
@@ -60,21 +72,25 @@ def take_order(item, quantity):
     name = str(item).strip().lower()
     label = name.title() or "that dish"
 
+    # the dish is checked first, so a made-up quantity can't hide an off-menu dish
+    dish = MENU.get(name)
+    if dish is None or dish["quantity"] == 0:
+        return {"ok": False, "reason": "not_available",
+                "message": f"Sorry, {label} is not available right now."}
+
     try:
         quantity = int(quantity)
     except (TypeError, ValueError):
         quantity = 0
     if quantity < 1:
-        return {"ok": False, "message": "Sorry, I didn't catch how many you want. How many would you like?"}
-
-    dish = MENU.get(name)
-    if dish is None or dish["quantity"] == 0:
-        return {"ok": False, "message": f"Sorry, {label} is not available right now."}
+        return {"ok": False, "reason": "bad_quantity",
+                "message": "Sorry, I didn't catch how many you want. How many would you like?"}
 
     left = dish["quantity"]
     if quantity > left:
         return {
             "ok": False,
+            "reason": "not_enough",
             "message": (f"Sorry, we only have {left} {label} left but you asked for {quantity}. "
                         "Please order less or pick something else."),
         }
@@ -165,20 +181,24 @@ Rules:
 
 
 class State(TypedDict):
-    user_input: str   # what the customer just typed
-    history: list     # earlier messages, so follow-ups like "make it 3" work
+    user_input: str      # what the customer just typed
+    history: list        # earlier messages, so follow-ups like "make it 3" work
     item: str
     quantity: int
     total_price: int
     order_id: str
-    status: str       # the routers below only look at this
-    message: str      # what the customer sees at the end
-    payment_qr: str   # the QR drawn as text, only filled in when it's time to pay
+    order_failures: int  # the three counters are for the whole chat, the chat loop
+    cook_failures: int   # hands them from one run of the graph to the next
+    serve_failures: int
+    status: str          # the routers below only look at this
+    message: str         # what the customer sees at the end
+    payment_qr: str      # the QR drawn as text, only filled in when it's time to pay
 
     # status goes: new -> no_order | order_failed | ordered
     #              ordered -> cook_failed | cooked
     #              cooked -> serve_failed | served
     #              served -> awaiting_payment
+    #              any *_failed -> quit, once its limit is passed
 
 
 def step(node, **update):
@@ -219,7 +239,11 @@ def take_order_node(state: State):
     result = take_order(args.get("item", ""), args.get("quantity", 1))
 
     if not result["ok"]:
-        return step("take_order", status="order_failed", message=result["message"])
+        failures = state["order_failures"]
+        if result["reason"] == "not_available":
+            failures += 1  # too little stock or an unclear quantity don't count
+        return step("take_order", status="order_failed", message=result["message"],
+                    order_failures=failures)
 
     return step("take_order", status="ordered",
                 item=result["item"], quantity=result["quantity"],
@@ -234,7 +258,8 @@ def cook_node(state: State):
         dish = f"{state['quantity']} x {state['item'].title()}"
         return step("cook", status="cook_failed",
                     message=(f"Sorry, we couldn't cook your {dish}: {result['reason']}. "
-                             "Your order has been cancelled, please place a new order."))
+                             "Your order has been cancelled, please place a new order."),
+                    cook_failures=state["cook_failures"] + 1)
 
     return step("cook", status="cooked")
 
@@ -246,7 +271,8 @@ def serve_node(state: State):
     if not result["ok"]:
         return step("serve", status="serve_failed",
                     message=(f"Your {dish} was cooked but we couldn't serve it: {result['reason']}. "
-                             "Please call a staff member."))
+                             "Please call a staff member."),
+                    serve_failures=state["serve_failures"] + 1)
 
     return step("serve", status="served",
                 message=f"Here is your {dish}. Total: Rs {state['total_price']}. Enjoy your meal!")
@@ -260,18 +286,41 @@ def payment_node(state: State):
     return step("payment", status="awaiting_payment", message=message, payment_qr=draw_qr(code))
 
 
-# edges: decide where to go next from the status
+def quit_node(state: State):
+    # status still says which stage failed too many times
+    reasons = {
+        "order_failed": f"You have asked for dishes we don't have {state['order_failures']} times.",
+        "cook_failed": f"Our kitchen has failed to cook {state['cook_failures']} times.",
+        "serve_failed": f"We have failed to serve you {state['serve_failures']} times.",
+    }
+    return step("quit", status="quit",
+                message=f"{state['message']}\n\n{reasons[state['status']]} Quitting the menu, goodbye!")
+
+
+# edges: decide where to go next from the status and the failure counters
 
 def after_take_order(state: State):
-    return "cook" if state["status"] == "ordered" else "end"
+    if state["status"] == "ordered":
+        return "cook"
+    if state["status"] == "order_failed" and state["order_failures"] > MAX_ORDER_FAILURES:
+        return "quit"
+    return "end"
 
 
 def after_cook(state: State):
-    return "serve" if state["status"] == "cooked" else "end"
+    if state["status"] == "cooked":
+        return "serve"
+    if state["cook_failures"] > MAX_COOK_FAILURES:
+        return "quit"
+    return "end"
 
 
 def after_serve(state: State):
-    return "payment" if state["status"] == "served" else "end"
+    if state["status"] == "served":
+        return "payment"
+    if state["serve_failures"] > MAX_SERVE_FAILURES:
+        return "quit"
+    return "end"
 
 
 builder = StateGraph(State)
@@ -279,17 +328,21 @@ builder.add_node("take_order", take_order_node)
 builder.add_node("cook", cook_node)
 builder.add_node("serve", serve_node)
 builder.add_node("payment", payment_node)
+builder.add_node("quit", quit_node)
 
 builder.add_edge(START, "take_order")
-builder.add_conditional_edges("take_order", after_take_order, {"cook": "cook", "end": END})
-builder.add_conditional_edges("cook", after_cook, {"serve": "serve", "end": END})
-builder.add_conditional_edges("serve", after_serve, {"payment": "payment", "end": END})
+builder.add_conditional_edges("take_order", after_take_order, {"cook": "cook", "quit": "quit", "end": END})
+builder.add_conditional_edges("cook", after_cook, {"serve": "serve", "quit": "quit", "end": END})
+builder.add_conditional_edges("serve", after_serve, {"payment": "payment", "quit": "quit", "end": END})
 builder.add_edge("payment", END)
+builder.add_edge("quit", END)
 
 graph = builder.compile()
 
 
-def run_order(user_input, history):
+def run_order(user_input, history, counts=None):
+    # counts = the three failure counters so far (see the chat loop below)
+    counts = counts or {"order_failures": 0, "cook_failures": 0, "serve_failures": 0}
     return graph.invoke({
         "user_input": user_input,
         "history": history,
@@ -300,12 +353,14 @@ def run_order(user_input, history):
         "status": "new",
         "message": "",
         "payment_qr": "",
+        **counts,
     })
 
 
 def main():
     print("Welcome to our restaurant! What would you like to order? (type 'quit' to leave)")
     history = []
+    counts = {"order_failures": 0, "cook_failures": 0, "serve_failures": 0}
 
     # each trip through this loop is one run of the graph, so after a failure the
     # customer just types a new order
@@ -319,10 +374,17 @@ def main():
         if not text:
             continue
 
-        result = run_order(text, history)
+        result = run_order(text, history, counts)
         print(f"\nBot: {result['message']}")
         if result["payment_qr"]:
             print(result["payment_qr"])
+
+        # a failure limit was passed, the chat is over
+        if result["status"] == "quit":
+            break
+
+        # carry the failure counters over to the next run
+        counts = {key: result[key] for key in counts}
 
         # keep the last few messages, but not the QR, it would only waste tokens
         history += [
